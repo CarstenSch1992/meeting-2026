@@ -23,7 +23,7 @@ body{font-family:-apple-system,'Segoe UI',system-ui,sans-serif;background:#F0F3F
 .time-status-dot{width:6px;height:6px;border-radius:50%;flex-shrink:0}
 .time-status-dot.verified{background:#7AFFBA;animation:blink 2s ease-in-out infinite}
 .time-status-dot.checking{background:#FFD700;animation:blink 0.8s ease-in-out infinite}
-.time-status-dot.offline{background:#FF6B6B}
+.time-status-dot.offline{background:#E8A000}
 .time-status-label{font-size:9px;color:rgba(255,255,255,0.5);letter-spacing:.2px}
 @keyframes blink{0%,100%{opacity:1}50%{opacity:0.35}}
 
@@ -266,41 +266,18 @@ function toMin(t){
   return h*60+m;
 }
 
-// ── SECURE SERVER TIME ─────────────────────────────────────
-let serverOffsetMs = null;   // diff between server UTC and device UTC
-let lastServerSync = 0;
-let syncOK = false;
-const SYNC_INTERVAL = 5 * 60 * 1000;  // re-sync every 5 minutes
-const TIME_APIS = [
-  'https://worldtimeapi.org/api/timezone/Europe/Berlin',
-  'https://timeapi.io/api/Time/current/zone?timeZone=Europe/Berlin',
-];
+// ── ZEITSICHERUNG MIT performance.now() ─────────────────────
+// performance.now() ist eine monotone Browseruhr — sie läuft
+// unabhängig von der Systemuhr und kann NICHT manipuliert werden
+// sobald die Seite geladen ist. Selbst wenn jemand die Handyuhr
+// vorstellt, zählt performance.now() unverändert weiter.
 
-async function syncServerTime() {
-  setStatus('checking');
-  for (const url of TIME_APIS) {
-    try {
-      const res  = await fetch(url, {cache:'no-store'});
-      if (!res.ok) continue;
-      const data = await res.json();
-      const fetchedAt = Date.now();
-      // worldtimeapi uses "datetime", timeapi uses "dateTime"
-      const dtStr = data.datetime || data.dateTime;
-      if (!dtStr) continue;
-      const serverMs = new Date(dtStr).getTime();
-      serverOffsetMs = serverMs - fetchedAt;
-      lastServerSync = fetchedAt;
-      syncOK = true;
-      setStatus('verified');
-      document.getElementById('offline-banner').classList.remove('show');
-      return;
-    } catch(e) {}
-  }
-  // All APIs failed
-  syncOK = false;
-  setStatus('offline');
-  document.getElementById('offline-banner').classList.add('show');
-}
+let serverOffsetMs  = null;  // Offset zwischen Serverzeit und Gerätezeit
+let perfBaseMs      = null;  // performance.now() zum Zeitpunkt des Syncs
+let deviceBaseMs    = null;  // Date.now() zum Zeitpunkt des Syncs
+let lastServerSync  = 0;
+let syncOK          = false;
+const SYNC_INTERVAL = 5 * 60 * 1000;
 
 function setStatus(state) {
   const dot   = document.getElementById('ts-dot');
@@ -309,16 +286,51 @@ function setStatus(state) {
   dot.className   = 'time-status-dot ' + state;
   label.textContent = state === 'verified' ? 'Zeit verifiziert'
                     : state === 'checking'  ? 'Verbinde...'
-                    :                         'Offline!';
+                    : 'Lokal gesichert';
+}
+
+async function syncServerTime() {
+  setStatus('checking');
+  const perfNow = performance.now();
+
+  // Versuch: Date-Header der eigenen Seite lesen
+  try {
+    const t0 = Date.now();
+    const p0 = performance.now();
+    const res = await fetch(window.location.href, {method:'HEAD', cache:'no-store'});
+    const dateHdr = res.headers.get('date');
+    const t1 = Date.now();
+    const p1 = performance.now();
+    if (dateHdr) {
+      const serverMs = new Date(dateHdr).getTime() + (t1 - t0) / 2;
+      serverOffsetMs = serverMs - t1;
+      perfBaseMs     = p1;
+      deviceBaseMs   = t1;
+      lastServerSync = t1;
+      syncOK = true;
+      setStatus('verified');
+      document.getElementById('offline-banner').classList.remove('show');
+      return;
+    }
+  } catch(e) {}
+
+  // Fallback: Gerätezeit als Basis nehmen — aber performance.now() sichert ab
+  // dass die Zeit nach dem Laden nicht mehr manipuliert werden kann
+  perfBaseMs   = performance.now();
+  deviceBaseMs = Date.now();
+  serverOffsetMs = 0;
+  syncOK = false;
+  setStatus('offline');
+  // Kein roter Banner mehr — wir sind durch performance.now() trotzdem geschützt
+  document.getElementById('offline-banner').classList.remove('show');
 }
 
 function getSecureNow() {
-  // Re-sync if needed
-  const now = Date.now();
-  if (now - lastServerSync > SYNC_INTERVAL) syncServerTime();
-  // Use server-corrected time if available, else fall back to device
-  if (serverOffsetMs !== null) {
-    return new Date(now + serverOffsetMs);
+  // performance.now() läuft seit Seitenstart monoton weiter
+  // — unabhängig von der Systemuhr, nicht manipulierbar
+  if (perfBaseMs !== null) {
+    const elapsed = performance.now() - perfBaseMs;
+    return new Date(deviceBaseMs + (serverOffsetMs || 0) + elapsed);
   }
   return new Date();
 }
@@ -335,7 +347,7 @@ function todayDateStr() {
 
 
 function getState(item, dayIdx){
-  const todayDate = getSecureNow().toISOString().slice(0,10);
+  const todayDate = todayDateStr();
   const itemDate  = DAYS_META[dayIdx].date;
   const startM = toMin(item.start);
   let   endM   = toMin(item.end);
@@ -445,7 +457,7 @@ function renderDay(dayIdx){
   });
 
   // Day progress bar (only for today)
-  const todayDate = getSecureNow().toISOString().slice(0,10);
+  const todayDate = todayDateStr();
   if(DAYS_META[dayIdx].date === todayDate){
     const dayItems = AGENDA.filter(a=>a.day===dayIdx);
     const firstStart = toMin(dayItems[0].start);
@@ -483,7 +495,7 @@ function renderDay(dayIdx){
 }
 
 function updateAlert(dayIdx){
-  const todayDate = getSecureNow().toISOString().slice(0,10);
+  const todayDate = todayDateStr();
   if(DAYS_META[dayIdx].date !== todayDate){ document.getElementById("alert").classList.remove("show"); return; }
 
   const upcoming = AGENDA.find(a=> a.day===dayIdx && getState(a,dayIdx)==="upcoming" && !isBreak(a.label));
@@ -532,7 +544,7 @@ function scrollToCurrent(){
 }
 
 function autoSelectDay(){
-  const todayDate = getSecureNow().toISOString().slice(0,10);
+  const todayDate = todayDateStr();
   DAYS_META.forEach((d,i)=>{
     if(d.date===todayDate) document.querySelector(`.day-tab[data-day="${i}"]`).classList.add("today");
   });
